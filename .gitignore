@@ -1,0 +1,41 @@
+# Virtual Environment
+venv/
+env/
+.venv/
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Development Files
+test_*.py
+*_test.py
+.pytest_cache/
+
+# IDE Files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Temporary Files
+*.tmp
+*.temp
+
+# Embedding/Model caches
+.emb_cache/
+.locks/
+models--*/
+.faiss_index/
