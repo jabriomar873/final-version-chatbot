@@ -17,7 +17,8 @@ PHASE_LINE = re.compile(r"(?i)phase\s*0*(\d+)\s*[:\-–]?\s*([^\n\r]{2,120})")
 RISK_HEADINGS = ["risk", "risque", "risks", "risques", "mitigation", "mitigation", "mitigations", "mitigations"]
 RISK_INLINE = re.compile(r"(?i)(risque|risk)\s*[:\-]\s*([^\n]{3,140})")
 MITIGATION_INLINE = re.compile(r"(?i)(mitigation|mesure|action)\s*[:\-]\s*([^\n]{3,140})")
-KPI_PATTERN = re.compile(r"(?i)\b([A-Z][A-Za-z0-9 _\-/]{2,40})\b[^\n]{0,40}?\b(\d{1,4}(?:[\.,]\d+)?\s?(?:%|jours|day[s]?|semaine[s]?|mois|€|eur|euros|k€|k|m|units?))")
+# KPI pattern: capture label + numeric+unit; exclude isolated single letters or code fragments
+KPI_PATTERN = re.compile(r"(?i)\b([A-Z][A-Za-z0-9 _\-/]{3,60})\b[^\n]{0,50}?\b(\d{1,4}(?:[\.,]\d+)?\s?(?:%|jours|day[s]?|semaine[s]?|mois|€|eur|euros|k€|k|m|units?))")
 NUM_UNIT = re.compile(r"(?i)\b(\d{1,4}(?:[\.,]\d+)?)\s?(%|jours?|days?|semaine[s]?|mois|€|eur|euros|k€|k|m|units?)")
 
 
@@ -82,6 +83,11 @@ def extract_kpis(docs: List[Document], max_docs: int = 80) -> List[Dict[str, Any
         for m in KPI_PATTERN.finditer(d.page_content):
             label = _clean(m.group(1))
             value = _clean(m.group(2))
+            # Filter noise: very short labels or labels that look like codes (e.g., 'MBST 31/:' or lone 'M')
+            if len(label) < 4:
+                continue
+            if re.fullmatch(r"[A-Z]{1,3}\d{0,3}", label):  # e.g., MB31, ABC2
+                continue
             kpis.append({
                 'label': label,
                 'value': value,
@@ -93,7 +99,10 @@ def extract_kpis(docs: List[Document], max_docs: int = 80) -> List[Dict[str, Any
         for ln in d.page_content.splitlines():
             if NUM_UNIT.search(ln):
                 snippet = _clean(ln)[:180]
-                kpis.append({'label': None, 'value': snippet, 'source': meta.get('source','doc'), 'page': meta.get('page','?'), 'evidence': snippet})
+                # Skip lines that are mostly punctuation or a single code token
+                if len(snippet.split()) < 2:
+                    continue
+                kpis.append({'label': None, 'value': snippet, 'source': meta.get('source','doc'), 'page': meta.get('page','?' ), 'evidence': snippet})
     # Deduplicate by full value+source+page
     seen=set(); final=[]
     for k in kpis:

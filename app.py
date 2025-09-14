@@ -690,10 +690,12 @@ def metrics_averages() -> dict:
 def handle_user_input(user_question):
     """Handle user input and generate response with enhanced accuracy"""
     try:
-        # Detect user language first
-        lang_user = detect_language_simple(user_question)
+        # Always answer in the document's dominant language; fall back to English if unknown
         doc_lang = st.session_state.get('doc_language')
-        lang = doc_lang if doc_lang else lang_user
+        if not doc_lang:
+            # Fallback detection only if document language missing
+            doc_lang = detect_language_simple(user_question)
+        lang = doc_lang
         st.session_state['last_lang'] = lang
         intent = detect_intent(user_question)
 
@@ -850,12 +852,25 @@ def handle_user_input(user_question):
                         response = {"answer": localize("Aucun risque structuré détecté dans les documents.", "No structured risks detected in the documents.", lang), "source_documents": reranked_docs[:3]}
                 elif getattr(qclass, 'is_kpis', False):
                     kg = st.session_state.get('knowledge_graph') or {}
-                    kpis = kg.get('kpis') or []
-                    if kpis:
+                    raw_kpis = kg.get('kpis') or []
+                    # Filter noisy KPI candidates (simple length + uniqueness heuristics)
+                    cleaned=[]; seen_vals=set()
+                    for kpi in raw_kpis:
+                        val = kpi.get('value','')
+                        if not val or len(val)<3: continue
+                        # Skip pure codes like MBST 31/ or stray 'M'
+                        if re.fullmatch(r"[A-Z]{1,4}\b", val):
+                            continue
+                        key=(kpi.get('label'), val)
+                        if key in seen_vals: continue
+                        seen_vals.add(key); cleaned.append(kpi)
+                        if len(cleaned)>=20: break
+                    if cleaned:
                         lines = [localize("Indicateurs / KPIs:", "KPIs / Metrics:", lang)]
-                        for k in kpis[:15]:
+                        for k in cleaned:
                             label = k.get('label') or localize('Valeur','Value',lang)
-                            lines.append(f"- {label}: {k.get('value')} [source: {k.get('source','doc')} p.{k.get('page','?')}]")
+                            display_val = k.get('value')
+                            lines.append(f"- {label}: {display_val} [source: {k.get('source','doc')} p.{k.get('page','?')}]")
                         response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:4]}
                     else:
                         response = {"answer": localize("Aucun indicateur trouvé.", "No indicators found.", lang), "source_documents": reranked_docs[:3]}
@@ -1210,12 +1225,13 @@ def main():
         # Display conversation (most recent first)
         for i in range(len(st.session_state.chat_history) - 1, -1, -1):
             message = st.session_state.chat_history[i]
-            if i % 2 == 0:  # User messages
-                user_msg = message.replace("Human: ", "")
-                st.write(user_template.replace("{{MSG}}", user_msg), unsafe_allow_html=True)
-            else:  # Bot messages
-                bot_msg = message.replace("Assistant: ", "")
-                st.write(bot_template.replace("{{MSG}}", bot_msg), unsafe_allow_html=True)
+            is_user = message.startswith("Human:")
+            text = message.split(": ",1)[1] if ": " in message else message
+            if is_user:
+                rendered = user_template.replace("__MSG__", text).replace("{{MSG}}", text)
+            else:
+                rendered = bot_template.replace("__MSG__", text).replace("{{MSG}}", text)
+            st.write(rendered, unsafe_allow_html=True)
 
 if __name__ == '__main__':
     main()

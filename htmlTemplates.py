@@ -126,18 +126,29 @@ main.block-container { padding-top: 1rem !important; }
 </style>
 '''
 
-bot_template = '''
-<div class="chat-message bot">
-    <div class="avatar">
-        <img src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 100 100'><circle cx='50' cy='50' r='48' fill='%2310b981'/><path d='M50 18 32 26v18l18 8 18-8V26L50 18zm0 30-18-8v24l18 12 18-12V40l-18 8z' fill='white' stroke='white' stroke-width='2' stroke-linejoin='round'/></svg>" alt="assistant">
-    </div>
-    <div class="message">{{MSG}}</div>
-</div>
-'''
+# Base64 fallback tiny placeholder (replace with real caveo.jpg if present)
+# Inline ChatGPT-like swirl SVG (white logo on emerald background)
+# Themeable background color for bot icon
+_BOT_ICON_BG = '#374151'  # Slate gray; adjust here for different theme
 
-user_template = '''
-<div class="chat-message user">
-    <div class="avatar" style="background:transparent;width:36px;height:36px;display:flex;align-items:center;justify-content:center;font-size:0.85rem;color:#3b82f6;font-weight:600;">U</div>
-    <div class="message">{{MSG}}</div>
-</div>
-'''
+_CHATGPT_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100' width='36' height='36'>"
+    f"<rect width='100' height='100' rx='18' fill='{_BOT_ICON_BG}'/>"
+    "<path fill='white' d='M50 22c6.5 0 12.4 3.2 16 8.1 5.7 1 10 6 10 12.1 0 2.4-.7 4.7-2 6.6.5 1.7.8 3.4.8 5.2 0 11.6-9.4 21-21 21-5.7 0-10.9-2.3-14.7-6-1.3.4-2.8.6-4.3.6-8 0-14.5-6.5-14.5-14.5 0-2.4.6-4.6 1.6-6.6C20.6 56.1 20 54 20 51.8c0-6.8 4.8-12.5 11.2-13.9C34 30 41.2 22 50 22Zm0 6c-6.1 0-11.3 4.2-12.7 10.1l-.6 2.5-2.6.4c-4.3.7-7.6 4.4-7.6 8.8 0 1.5.4 3 1 4.3l1.3 2.5-1.5 2.4c-.8 1.3-1.2 2.8-1.2 4.3 0 4.7 3.8 8.5 8.5 8.5 1.3 0 2.6-.3 3.7-.8l2.6-1.3 2 2.1c2.8 3 6.6 4.7 10.5 4.7 8.3 0 15-6.7 15-15 0-1.4-.2-2.8-.6-4.1l-.8-2.7 1.7-2.3c1-1.3 1.5-2.9 1.5-4.5 0-4.2-3-7.7-7.1-8.4l-2.6-.5-.9-2.5C60.9 34.9 55.8 30 50 30Z'/>"
+    "</svg>"
+)
+
+bot_template = (
+    '<div class="chat-message bot">'
+    '<div class="avatar" style="display:flex;align-items:center;justify-content:center;width:36px;height:36px;">'
+    + _CHATGPT_SVG +
+    '</div>'
+    '<div class="message">__MSG__</div>'
+    '</div>'
+)
+
+user_template = (
+    '<div class="chat-message user">'
+    '<div class="message" style="margin-left:4px;">__MSG__</div>'
+    '</div>'
+)
