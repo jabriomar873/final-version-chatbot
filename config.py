@@ -149,7 +149,7 @@ METRICS_CONFIG = {
 
 # UI adjustments
 UI_CONFIG = {
-    "show_metrics_panel": True,
+    "show_metrics_panel": False,  # disabled to simplify UI
     "show_confidence_badge": True,
     "max_source_snippet_chars": 320,
     # Highlight citations like [source: file p.X]

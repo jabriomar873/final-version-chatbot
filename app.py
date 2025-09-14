@@ -47,11 +47,14 @@ from config import (
 )
 from cache_utils import cache_key, load_cache, save_cache
 from intent_detection import detect_intent, generate_greeting_response, generate_simple_chat_response, should_use_enhanced_retrieval
+from question_routing import classify_question, generic_count_occurrences
+from knowledge_graph import build_knowledge_graph
 import warnings
 import subprocess
 import re
 from datetime import datetime
 import time
+import math
 
 # Suppress common warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
@@ -574,92 +577,176 @@ def check_ollama_installation():
     except:
         return False
 
+# ---------------- Friendly Ollama error handling (memory, etc.) ----------------
+def _is_model_memory_error(msg: str) -> bool:
+    if not msg:
+        return False
+    m = msg.lower()
+    return "requires more system memory" in m or ("system memory" in m and "requires" in m)
+
+def _show_model_memory_help(lang: str = 'en'):
+    tip_fr = (
+        "Le modèle n'a pas pu être chargé: mémoire insuffisante.\n"
+        "Suggestions :\n"
+        "• Fermez d'autres applications lourdes (navigateurs, IDE).\n"
+        "• Réduisez le nombre ou la taille des PDFs.\n"
+        "• Utilisez un modèle plus léger (ex: 'llama3.2:1b', 'phi3:3.8b', 'mistral:7b-instruct-q4_K_M').\n"
+        "• Assurez-vous d'une version quantifiée (q4_K_M, q4_0, etc.)."
+    )
+    tip_en = (
+        "The model could not be loaded (insufficient RAM).\n"
+        "Suggestions:\n"
+        "• Close other heavy apps (browsers, IDE).\n"
+        "• Reduce number/size of PDFs.\n"
+        "• Use a smaller model (e.g. 'llama3.2:1b', 'phi3:3.8b', 'mistral:7b-instruct-q4_K_M').\n"
+        "• Ensure a quantized variant (q4_K_M, q4_0, etc.)."
+    )
+    st.warning(localize(tip_fr, tip_en, lang))
+
+def _handle_possible_ollama_error(e: Exception, lang: str = 'en') -> bool:
+    msg = str(e)
+    if _is_model_memory_error(msg):
+        _show_model_memory_help(lang)
+        return True
+    return False
+
+# ---------------- Answer post-processing utilities ----------------
+def normalize_answer(text: str) -> str:
+    """Light normalization: trim, collapse multiple blank lines, unify bullets, strip trailing spaces."""
+    if not isinstance(text, str):
+        return text
+    t = text.strip('\n ')
+    # Normalize line endings
+    t = t.replace('\r\n', '\n').replace('\r', '\n')
+    # Collapse 3+ blank lines -> 2
+    while '\n\n\n' in t:
+        t = t.replace('\n\n\n', '\n\n')
+    lines = []
+    for raw in t.split('\n'):
+        ln = raw.rstrip()
+        # unify bullet markers
+        if re.match(r"^\s*[-*•]\s+", ln):
+            ln = re.sub(r"^\s*[-*•]\s+", "• ", ln)
+        elif re.match(r"^\s*\d+\.\s+", ln):
+            # keep numbered list but trim extra spaces
+            ln = re.sub(r"^\s*(\d+\.)\s+", r"\1 ", ln)
+        lines.append(ln)
+    t = "\n".join(lines)
+    # Remove trailing whitespace again
+    return t.strip()
+
+def wrap_citations(answer: str) -> str:
+    """Wrap [source: file p.X] like patterns in span.citation for styling."""
+    if not answer or '[source:' not in answer:
+        return answer
+    def repl(m):
+        inner = m.group(0)
+        return f"<span class=\"citation\">{inner}</span>"
+    return re.sub(r"\[source:[^\]]+\]", repl, answer)
+
+def ensure_minimum_citations(answer: str, docs: List[Document]) -> str:
+    """If answer lacks any citation, append up to two citations from doc metadata."""
+    if '[source:' in answer or not docs:
+        return answer
+    cites = []
+    seen = set()
+    for d in docs[:3]:
+        md = getattr(d, 'metadata', {}) or {}
+        src = md.get('source', 'doc')
+        page = md.get('page', '?')
+        key = (src, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        cites.append(f"[source: {src} p.{page}]")
+        if len(cites) >= 2:
+            break
+    if cites:
+        answer = answer.rstrip() + "\n" + " ".join(cites)
+    return answer
+
+def record_metrics_snapshot():
+    """Store current metrics dict into a rolling history for aggregation."""
+    if 'metrics' not in st.session_state:
+        return
+    hist = st.session_state.setdefault('metrics_history', [])
+    hist.append(dict(st.session_state['metrics']))
+    # Trim history
+    max_h = METRICS_CONFIG.get('max_history', 20)
+    if len(hist) > max_h:
+        del hist[:-max_h]
+
+def metrics_averages() -> dict:
+    hist = st.session_state.get('metrics_history') or []
+    if not hist:
+        return {}
+    agg = {}
+    for row in hist:
+        for k,v in row.items():
+            if isinstance(v,(int,float)):
+                agg.setdefault(k, []).append(v)
+    return {k: round(sum(vs)/len(vs), 2) for k,vs in agg.items() if vs}
+
 def handle_user_input(user_question):
     """Handle user input and generate response with enhanced accuracy"""
     try:
         # Detect user language first
         lang_user = detect_language_simple(user_question)
-        # If we have a dominant document language, prefer it for answers
         doc_lang = st.session_state.get('doc_language')
         lang = doc_lang if doc_lang else lang_user
         st.session_state['last_lang'] = lang
-        # Detect user intent first
         intent = detect_intent(user_question)
-        
-        # Handle greetings and simple chat without document retrieval
-        if intent == "greeting":
-            response_text = generate_greeting_response(lang)
-            
-            # Update chat history
-            if 'chat_history' not in st.session_state:
-                st.session_state.chat_history = []
-            
-            st.session_state.chat_history.append(f"Human: {user_question}")
-            st.session_state.chat_history.append(f"Assistant: {response_text}")
-            return
-            
-        elif intent == "simple_chat":
-            response_text = generate_simple_chat_response(user_question, lang)
-            
-            # Update chat history
-            if 'chat_history' not in st.session_state:
-                st.session_state.chat_history = []
-            
-            st.session_state.chat_history.append(f"Human: {user_question}")
-            st.session_state.chat_history.append(f"Assistant: {response_text}")
-            return
-        
-        # Helper to update memory after each exchange
-        def update_memory(user_q: str, bot_a: str):
-            try:
-                # Append to chat history as plain strings
-                if 'chat_history' not in st.session_state:
-                    st.session_state.chat_history = []
-                st.session_state.chat_history.append(f"Human: {user_q}")
-                st.session_state.chat_history.append(f"Assistant: {bot_a}")
 
-                # Summarize if too long
-                total_msgs = len(st.session_state.chat_history)
-                if total_msgs > MEMORY_CONFIG.get("summarize_after", 10):
-                    # Build summary prompt
-                    last_k = MEMORY_CONFIG.get("keep_last", 6)
+        # --- Lightweight chat intents ---
+        if intent == "greeting":
+            resp = generate_greeting_response(lang)
+            st.session_state.setdefault('chat_history', [])
+            st.session_state.chat_history += [f"Human: {user_question}", f"Assistant: {resp}"]
+            return
+        if intent == "simple_chat":
+            resp = generate_simple_chat_response(user_question, lang)
+            st.session_state.setdefault('chat_history', [])
+            st.session_state.chat_history += [f"Human: {user_question}", f"Assistant: {resp}"]
+            return
+
+        # --- Memory helper ---
+        def update_memory(uq: str, ba: str):
+            try:
+                st.session_state.setdefault('chat_history', [])
+                st.session_state.chat_history += [f"Human: {uq}", f"Assistant: {ba}"]
+                total = len(st.session_state.chat_history)
+                if total > MEMORY_CONFIG.get('summarize_after', 10):
+                    last_k = MEMORY_CONFIG.get('keep_last', 6)
                     keep = st.session_state.chat_history[-last_k:]
                     earlier = st.session_state.chat_history[:-last_k]
-                    messages_str = "\n".join(earlier)
-                    prompt = MEMORY_CONFIG.get("summary_prompt", "").format(
-                        current_summary=st.session_state.get('memory_summary', ""),
-                        messages=messages_str
+                    prompt = MEMORY_CONFIG.get('summary_prompt', '').format(
+                        current_summary=st.session_state.get('memory_summary', ''),
+                        messages="\n".join(earlier)
                     )
-                    # Use current model (Ollama) to summarize locally
-                    model = st.session_state.model_info.get('model') if hasattr(st.session_state, 'model_info') else None
-                    if model and hasattr(st.session_state, 'conversation') and st.session_state.conversation:
-                        # Reuse LLM via combine_docs_chain without docs
+                    model_name = st.session_state.get('model_info', {}).get('model')
+                    if model_name:
                         try:
-                            llm_only = OllamaLLM(model=model, temperature=0.0, top_p=0.9, top_k=40)
-                            summary = llm_only.invoke(prompt)
+                            llm_sum = OllamaLLM(model=model_name, temperature=0.0, top_p=0.9, top_k=40)
+                            summary = llm_sum.invoke(prompt)
                             st.session_state.memory_summary = summary.strip()
-                            # Keep only last_k recent messages plus summary anchor
                             st.session_state.chat_history = keep
                         except Exception:
                             pass
             except Exception:
                 pass
 
-        # For document analysis questions, use enhanced retrieval
-        if intent == "document_analysis":
+        # --- Document analysis path ---
+        if intent == 'document_analysis':
             with st.spinner("🔍 Analyzing documents thoroughly..."):
-                # Detect summarization request early
-                lower_q = user_question.lower().strip()
-                wants_summary = any(k in lower_q for k in ["summarize", "summary", "résume", "resumer", "résumer", "resume", "synthèse", "synthese"])
-                if wants_summary:
+                qclass = classify_question(user_question)
+                # Summarization branch
+                if qclass.is_summary:
                     chunks = st.session_state.get('all_chunks') or []
                     if not chunks:
                         st.warning(localize("Aucun document traité pour résumer.", "No processed document available to summarize.", lang))
                         return
-                    # Concatenate limited text
                     max_chars = 8000
-                    acc = []
-                    total = 0
+                    acc, total = [], 0
                     for c in chunks:
                         txt = c.page_content.strip()
                         if not txt:
@@ -667,324 +754,293 @@ def handle_user_input(user_question):
                         if total + len(txt) > max_chars:
                             acc.append(txt[: max_chars - total])
                             break
-                        acc.append(txt)
-                        total += len(txt)
+                        acc.append(txt); total += len(txt)
                     corpus = "\n\n".join(acc)
-                    # Build a simple summarization prompt
                     if lang == 'fr':
-                        sum_prompt = ("Résume de façon structurée le contenu suivant en 6 à 10 puces concises, "
-                                      "sans ajouter d'informations non présentes. Utilise des phrases brèves.\n\nTEXTE:\n" + corpus + "\n\nRÉSUMÉ:")
+                        sum_prompt = ("Résume de façon structurée le contenu suivant en 6 à 10 puces concises, sans ajouter d'informations non présentes. Utilise des phrases brèves.\n\nTEXTE:\n" + corpus + "\n\nRÉSUMÉ:")
                     else:
-                        sum_prompt = ("Provide a structured summary of the following content in 6-10 concise bullet points, "
-                                      "without adding any information that is not present. Use brief factual sentences.\n\nTEXT:\n" + corpus + "\n\nSUMMARY:")
+                        sum_prompt = ("Provide a structured summary of the following content in 6-10 concise bullet points, without adding any information that is not present. Use brief factual sentences.\n\nTEXT:\n" + corpus + "\n\nSUMMARY:")
                     try:
-                        model_name = st.session_state.model_info.get('model') if hasattr(st.session_state, 'model_info') else DEFAULT_MODEL
+                        model_name = st.session_state.get('model_info', {}).get('model', DEFAULT_MODEL)
                         llm_tmp = OllamaLLM(model=model_name, temperature=0.0, top_p=0.9, top_k=40)
-                        summary = llm_tmp.invoke(sum_prompt)
-                        # Update memory & display
-                        if 'chat_history' not in st.session_state:
-                            st.session_state.chat_history = []
-                        st.session_state.chat_history.append(f"Human: {user_question}")
-                        st.session_state.chat_history.append(f"Assistant: {summary.strip()}")
-                        st.write(bot_template.replace("{{MSG}}", summary.strip()), unsafe_allow_html=True)
+                        summary = llm_tmp.invoke(sum_prompt).strip()
+                        # Uniform post-processing pipeline + memory update
+                        summary = normalize_answer(summary)
+                        if UI_CONFIG.get('highlight_citations'):
+                            summary = wrap_citations(summary)
+                        update_memory(user_question, summary)
                         return
-                    except Exception as se:
-                        st.error(localize(f"Erreur de résumé: {se}", f"Summarization error: {se}", lang))
+                    except Exception as e:
+                        if not _handle_possible_ollama_error(e, lang):
+                            st.error("❌ Failed to summarize with local LLM.")
                         return
-                # Enhance the user query for better retrieval
+
                 enhanced_question = enhance_query(user_question)
-                
-                # Get existing chat history from session state
                 chat_history = st.session_state.get('chat_history', [])
-                
-                # Convert string format to tuples for LangChain compatibility
                 formatted_history = []
                 for i in range(0, len(chat_history), 2):
                     if i + 1 < len(chat_history):
-                        human_msg = chat_history[i].replace("Human: ", "")
-                        ai_msg = chat_history[i + 1].replace("Assistant: ", "")
-                        formatted_history.append((human_msg, ai_msg))
-                
-                # Simple question-type routing
-                ql = user_question.lower()
-                is_phase_counting = any(p in ql for p in ["how many phases", "combien de phases", "number of phases", "phases are", "phases dans"]) or ("how many" in ql and "phase" in ql)
-                is_subject = any(p in ql for p in ["subject", "objet", "what is the subject", "objet du document", "scope", "purpose"])
-                # Detect plural/all-docs variant
-                is_subject_all = is_subject and any(p in ql for p in [
-                    "all documents", "tous les documents", "toutes les documents", "tous les pdf",
-                    "each document", "every document", "pour chaque document", "de tous les documents"
-                ])
-                is_actors = any(p in ql for p in ["actor", "acteurs", "intervenants", "stakeholders", "team", "équipe"])
-                is_critical = (any(p in ql for p in ["most important", "critical", "critique", "étape la plus importante"]) 
-                               and ("phase" in ql or "step" in ql))
-                
-                # Get retriever from session state
+                        formatted_history.append((chat_history[i].replace("Human: ", ""), chat_history[i+1].replace("Assistant: ", "")))
+
                 retriever = st.session_state.retriever
-                
-                # For phase counting, use more aggressive retrieval
-                if is_phase_counting and hasattr(retriever, 'search_kwargs'):
-                    retriever.search_kwargs["k"] = max(20, RETRIEVAL_CONFIG.get("initial_k", 10))
-                    retriever.search_kwargs["fetch_k"] = max(40, RETRIEVAL_CONFIG.get("fetch_k", 20))
-                
-                # Retrieve documents with timing
-                rt0 = time.time()
-                retrieved_docs = retriever.get_relevant_documents(enhanced_question)
-                rtime = time.time() - rt0
+                if qclass.is_phase_count and hasattr(retriever, 'search_kwargs'):
+                    retriever.search_kwargs['k'] = max(20, RETRIEVAL_CONFIG.get('initial_k', 10))
+                    retriever.search_kwargs['fetch_k'] = max(40, RETRIEVAL_CONFIG.get('fetch_k', 20))
+
+                # Dynamic retrieval tuning for summary / generic queries
+                if qclass.is_summary and hasattr(retriever, 'search_kwargs'):
+                    retriever.search_kwargs['k'] = min(12, RETRIEVAL_CONFIG.get('initial_k', 10))
+                    retriever.search_kwargs['fetch_k'] = min(24, RETRIEVAL_CONFIG.get('fetch_k', 20))
+
+                rt0 = time.time(); retrieved_docs = retriever.get_relevant_documents(enhanced_question); rtime = time.time() - rt0
                 if METRICS_CONFIG.get('enable') and METRICS_CONFIG.get('collect_retrieval_latency'):
                     st.session_state.setdefault('metrics', {})['retrieval_ms'] = int(rtime * 1000)
-                
-                # Re-rank documents for better relevance (timed)
-                rr0 = time.time()
-                reranked_docs = rerank_retrieved_docs(retrieved_docs, user_question)
-                rrerank = time.time() - rr0
+                rr0 = time.time(); reranked_docs = rerank_retrieved_docs(retrieved_docs, user_question); rrerank = time.time() - rr0
                 if METRICS_CONFIG.get('enable') and METRICS_CONFIG.get('collect_rerank_latency'):
                     st.session_state.setdefault('metrics', {})['rerank_ms'] = int(rrerank * 1000)
 
-                # Confidence gate: estimate evidence score from top docs
-                def estimate_evidence_score(docs):
-                    if not docs:
-                        return 0.0
+                # Remove near-duplicate context fragments (simple similarity on first 160 chars)
+                pruned = []
+                seen_sigs = set()
+                for d in reranked_docs:
+                    sig = re.sub(r"\s+", " ", d.page_content[:160].lower())
+                    if sig in seen_sigs:
+                        continue
+                    seen_sigs.add(sig)
+                    pruned.append(d)
+                reranked_docs = pruned
+
+                def evidence_score_fn(docs):
+                    if not docs: return 0.0
                     text = "\n".join(d.page_content.lower() for d in docs[:6])
-                    cues = ["phase 00", "phase 01", "phase 02", "phase 03", "source", "procedure", "processus", "section"]
+                    cues = ["phase 00","phase 01","phase 02","phase 03","source","procedure","processus","section"]
                     hits = sum(1 for c in cues if c in text)
                     density = min(1.0, hits / max(4, len(cues)))
-                    # Light length prior
                     length = sum(len(d.page_content) for d in docs[:6])
                     len_factor = 1.0 if length > 2000 else 0.3 if length < 600 else 0.6
-                    return 0.5 * density + 0.5 * len_factor
+                    return 0.5*density + 0.5*len_factor
+                evidence_score = evidence_score_fn(reranked_docs)
 
-                evidence_score = estimate_evidence_score(reranked_docs)
-                
-                # Create enhanced context
-                enhanced_context = create_enhanced_context(reranked_docs, user_question)
-                
-                # Use specialized handling
-                if is_subject:
-                    # List subjects for all documents if the question implies it
-                    if is_subject_all:
-                        idx = st.session_state.get('subject_index') or {}
-                        if idx:
-                            lines = [localize("Sujets par document:", "Subjects per document:", lang)]
-                            for src in sorted(idx.keys()):
-                                entry = idx[src]
-                                subj = entry.get('subject')
-                                pg = entry.get('page')
-                                label = localize("source", "source", lang)
-                                lines.append(f"- {src}: {subj} [{label}: {src} p.{pg}]")
-                            response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:3]}
-                            # Update memory and skip single-doc subject flow
-                            update_memory(user_question, response['answer'])
-                            if 'source_documents' in response and response['source_documents']:
-                                with st.expander("📚 Sources utilisées"):
-                                    for i, doc in enumerate(response['source_documents'][:3]):
-                                        meta = doc.metadata if hasattr(doc, 'metadata') else {}
-                                        src = meta.get('source', 'unknown')
-                                        page = meta.get('page', '?')
-                                        st.text(f"Source {i+1} — {src} (page {page}):\n{doc.page_content[:400]}...")
-                            return
-                    # Prefer global subject index built at processing time
-                    idx = st.session_state.get('subject_index') or {}
-                    chosen_src = None
-                    chosen = None
-                    if idx:
-                        counts = {}
-                        for d in reranked_docs[:6]:
-                            m = getattr(d, 'metadata', {}) or {}
-                            src = m.get('source')
-                            if src in idx:
-                                counts[src] = counts.get(src, 0) + 1
-                        if counts:
-                            chosen_src = max(counts, key=counts.get)
-                            chosen = idx.get(chosen_src)
-                        else:
-                            # pick any
-                            chosen_src, chosen = next(iter(idx.items())) if idx else (None, None)
-                    if chosen:
-                        ans = localize("Sujet", "Subject", lang) + f": {chosen.get('subject')} [source: {chosen_src} p.{chosen.get('page')}]"
-                        response = {"answer": ans, "source_documents": reranked_docs[:3]}
+                # Specialized handlers ---------------------------------
+                if qclass.is_generic_count and not qclass.is_phase_count:
+                    all_docs = st.session_state.get('all_chunks') or []
+                    res = generic_count_occurrences(qclass.generic_count_target, all_docs)
+                    if res['count'] == 0:
+                        res = generic_count_occurrences(qclass.generic_count_target, reranked_docs)
+                    if lang=='fr':
+                        ans = f"Occurrence(s) de '{qclass.generic_count_target}' trouvées: {res['count']} (sur {res['docs_considered']} fragments)."
                     else:
-                        # fallback: local extraction from retrieved docs
-                        sub = extract_subject_from_docs(reranked_docs)
-                        if sub:
-                            ans = localize("Sujet", "Subject", lang) + f": {sub['subject']} [source: {sub['source']} p.{sub['page']}]"
+                        ans = f"Occurrences of '{qclass.generic_count_target}' found: {res['count']} (across {res['docs_considered']} chunks)."
+                    if res['sample_evidence']:
+                        ans += "\n" + ("Exemples:" if lang=='fr' else "Examples:") + "\n" + "\n".join(f"- {e}" for e in res['sample_evidence'])
+                    response = {"answer": ans, "source_documents": reranked_docs[:3]}
+                elif getattr(qclass, 'is_risks', False):
+                    kg = st.session_state.get('knowledge_graph') or {}
+                    risks = kg.get('risks') or []
+                    if risks:
+                        lines = [localize("Risques identifiés:", "Identified risks:", lang)]
+                        for r in risks[:15]:
+                            base = f"- {r.get('risk')}"
+                            if r.get('mitigation'):
+                                base += (localize(" | Mitigation: ", " | Mitigation: ", lang) + r.get('mitigation'))
+                            base += f" [source: {r.get('source','doc')} p.{r.get('page','?')}]"
+                            lines.append(base)
+                        response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:4]}
+                    else:
+                        response = {"answer": localize("Aucun risque structuré détecté dans les documents.", "No structured risks detected in the documents.", lang), "source_documents": reranked_docs[:3]}
+                elif getattr(qclass, 'is_kpis', False):
+                    kg = st.session_state.get('knowledge_graph') or {}
+                    kpis = kg.get('kpis') or []
+                    if kpis:
+                        lines = [localize("Indicateurs / KPIs:", "KPIs / Metrics:", lang)]
+                        for k in kpis[:15]:
+                            label = k.get('label') or localize('Valeur','Value',lang)
+                            lines.append(f"- {label}: {k.get('value')} [source: {k.get('source','doc')} p.{k.get('page','?')}]")
+                        response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:4]}
+                    else:
+                        response = {"answer": localize("Aucun indicateur trouvé.", "No indicators found.", lang), "source_documents": reranked_docs[:3]}
+                elif qclass.is_subject:
+                    idx = st.session_state.get('subject_index') or {}
+                    if qclass.is_subject_all and idx:
+                        lines = [localize("Sujets par document:", "Subjects per document:", lang)]
+                        for src in sorted(idx.keys()):
+                            entry = idx[src]; subj = entry.get('subject'); pg = entry.get('page'); lbl = localize('source','source',lang)
+                            lines.append(f"- {src}: {subj} [{lbl}: {src} p.{pg}]")
+                        response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:3]}
+                    else:
+                        chosen_src = None; chosen = None
+                        if idx:
+                            counts = {}
+                            for d in reranked_docs[:6]:
+                                src = getattr(d,'metadata',{}).get('source')
+                                if src in idx: counts[src] = counts.get(src,0)+1
+                            if counts:
+                                chosen_src = max(counts,key=counts.get); chosen = idx[chosen_src]
+                            else:
+                                chosen_src, chosen = next(iter(idx.items())) if idx else (None,None)
+                        if chosen:
+                            ans = localize('Sujet','Subject',lang)+f": {chosen.get('subject')} [source: {chosen_src} p.{chosen.get('page')}]"
+                            response = {"answer": ans, "source_documents": reranked_docs[:3]}
                         else:
-                            ans = localize("Je ne trouve pas le sujet dans les documents fournis.", "I can't find the subject in the provided documents.", lang)
-                        response = {"answer": ans, "source_documents": reranked_docs[:3]}
-
-                elif is_actors:
-                    acts = extract_actors_from_docs(reranked_docs)
-                    if acts:
-                        lines = [localize("Acteurs/intervenants principaux:", "Main actors/stakeholders:", lang)]
-                        for i, a in enumerate(acts[:12], 1):
+                            sub = extract_subject_from_docs(reranked_docs)
+                            if sub:
+                                ans = localize('Sujet','Subject',lang)+f": {sub['subject']} [source: {sub['source']} p.{sub['page']}]"
+                            else:
+                                ans = localize("Je ne trouve pas le sujet dans les documents fournis.","I can't find the subject in the provided documents.",lang)
+                            response = {"answer": ans, "source_documents": reranked_docs[:3]}
+                elif qclass.is_actors:
+                    actors = extract_actors_from_docs(reranked_docs)
+                    if actors:
+                        lines = [localize("Acteurs/intervenants principaux:","Main actors/stakeholders:",lang)]
+                        for i,a in enumerate(actors[:12],1):
                             lines.append(f"{i}. {a['name']} [source: {a['source']} p.{a['page']}]")
                         ans = "\n".join(lines)
                     else:
-                        ans = localize("Je ne trouve pas la liste des acteurs dans les documents fournis.", "I can't find the list of actors in the provided documents.", lang)
+                        ans = localize("Je ne trouve pas la liste des acteurs dans les documents fournis.","I can't find the list of actors in the provided documents.",lang)
                     response = {"answer": ans, "source_documents": reranked_docs[:3]}
-
-                elif is_critical:
-                    # If docs do not define a single critical phase, state that clearly
+                elif qclass.is_critical_phase:
                     phase_map = extract_phases_from_docs(reranked_docs)
                     if not phase_map:
-                        ans = localize("Les documents ne définissent pas d'étape critique unique.", "The documents do not define a single critical step.", lang)
+                        ans = localize("Les documents ne définissent pas d'étape critique unique.","The documents do not define a single critical step.",lang)
                     else:
-                        ans = localize(
-                            ("Les documents ne définissent pas explicitement une phase 'critique'. "
-                             "La production/validation (Phases 02–03) apparaissent comme sensibles selon le contexte, "
-                             "mais aucune mention formelle n'établit une 'phase la plus importante'."),
-                            ("The documents do not explicitly define a 'critical' phase. "
-                             "Production/validation (Phases 02–03) appear sensitive in context, "
-                             "but no formal source declares a 'most important' phase."),
-                            lang)
+                        ans = localize("Les documents ne définissent pas explicitement une phase 'critique'. Production/validation (Phases 02–03) apparaissent sensibles, mais aucune mention formelle.","The documents do not explicitly define a 'critical' phase. Production/validation (Phases 02–03) appear sensitive, but no formal source declares it.",lang)
                     response = {"answer": ans, "source_documents": reranked_docs[:4]}
-
-                elif is_phase_counting:
-                    # Create a temporary conversation chain with phase counting prompt (kept for reference)
-                    # First, extract phases deterministically from the whole corpus
-                    phase_map = build_global_phase_map()
-                    # If empty (unlikely), fall back to retrieved docs
-                    if not phase_map:
-                        phase_map = extract_phases_from_docs(reranked_docs)
-                    # If likely incomplete (e.g., missing 03 while 01/02 exist), expand search once
+                elif qclass.is_phase_count:
+                    phase_map = build_global_phase_map() or extract_phases_from_docs(reranked_docs)
                     if 1 in phase_map and 2 in phase_map and 3 not in phase_map:
                         more_docs = retriever.get_relevant_documents(enhanced_question + " phase 03 production série")
                         more_docs = rerank_retrieved_docs(more_docs, user_question)
-                        merge_map = extract_phases_from_docs(more_docs)
-                        for k, v in merge_map.items():
-                            if k not in phase_map or (v.get("name") and len(v.get("name","")) > len(phase_map[k].get("name",""))):
+                        for k,v in extract_phases_from_docs(more_docs).items():
+                            if k not in phase_map or (v.get('name') and len(v.get('name','')) > len(phase_map[k].get('name',''))):
                                 phase_map[k] = v
-
-                    # Build a crisp, grounded answer from the extracted phases
                     if phase_map:
                         sorted_nums = sorted(phase_map.keys())
-                        if lang == 'fr':
-                            lines = [f"Il y a {len(sorted_nums)} phases principales dans ce projet :"]
-                        else:
-                            lines = [f"There are {len(sorted_nums)} main phases in this project:"]
-                        for i, n in enumerate(sorted_nums, 1):
-                            name = phase_map[n].get("name") or ""
-                            # Preferred citation from extractor map
-                            cite = ""
-                            cites = phase_map[n].get('citations', [])
+                        lines = [ (f"Il y a {len(sorted_nums)} phases principales dans ce projet :" if lang=='fr' else f"There are {len(sorted_nums)} main phases in this project:") ]
+                        for i,n in enumerate(sorted_nums,1):
+                            name = phase_map[n].get('name') or ''
+                            cite = ''
+                            cites = phase_map[n].get('citations',[])
                             if cites:
-                                c0 = cites[0]
-                                cite = f" [source: {c0.get('source','doc')} p.{c0.get('page','?')}]"
+                                c0 = cites[0]; cite = f" [source: {c0.get('source','doc')} p.{c0.get('page','?')}]"
                             if not cite:
-                                # Derive a short citation from retrieved docs as fallback
                                 for d in reranked_docs:
                                     if f"phase {n:02d}" in d.page_content.lower() or f"phase {n}" in d.page_content.lower():
-                                        m = getattr(d, 'metadata', {}) or {}
-                                        src = m.get('source', 'doc')
-                                        page = m.get('page', '?')
-                                        cite = f" [source: {src} p.{page}]"
-                                        break
-                            if name:
-                                if lang == 'fr':
-                                    lines.append(f"{i}.  Phase {n:02d} : {name}{cite}")
-                                else:
-                                    lines.append(f"{i}.  Phase {n:02d}: {name}{cite}")
+                                        md = getattr(d,'metadata',{}) or {}
+                                        cite = f" [source: {md.get('source','doc')} p.{md.get('page','?')}]"; break
+                            if lang=='fr':
+                                lines.append(f"{i}.  Phase {n:02d} : {name}{cite}")
                             else:
-                                lines.append(f"{i}.  Phase {n:02d}{cite}")
+                                lines.append(f"{i}.  Phase {n:02d}: {name}{cite}")
                         response = {"answer": "\n".join(lines), "source_documents": reranked_docs[:5]}
                     else:
-                        # Fall back to LLM generation with strict instruction
-                        instruction = ("CONSIGNE STRICTE: Basez-vous UNIQUEMENT sur les documents fournis. Ne mentionnez que les phases qui existent vraiment. Question: " if lang=='fr' else 
-                                       "STRICT INSTRUCTION: Base ONLY on the provided documents. Mention only phases that actually exist. Question: ")
-                        response_txt = st.session_state.conversation.combine_docs_chain.run(
-                            input_documents=reranked_docs[:8], 
+                        instruction = ("CONSIGNE STRICTE: Basez-vous UNIQUEMENT sur les documents. Question: " if lang=='fr' else "STRICT INSTRUCTION: Base ONLY on documents. Question: ")
+                        resp_txt = st.session_state.conversation.combine_docs_chain.run(
+                            input_documents=reranked_docs[:8],
                             question=instruction + user_question + ("\nRéponds en français." if lang=='fr' else "\nAnswer in English.")
                         )
-                        response = {"answer": response_txt, "source_documents": reranked_docs[:5]}
+                        response = {"answer": resp_txt, "source_documents": reranked_docs[:5]}
                 else:
-                    # Include memory summary and last turns in the question to improve continuity
-                    memory_header = ""
+                    memory_header = ''
                     if st.session_state.get('memory_summary'):
-                        memory_header += ("Contexte de la conversation (résumé): " if lang=='fr' else "Conversation context (summary): ") + f"{st.session_state.memory_summary}\n"
-                    # Also include last few turns verbatim
-                    tail = st.session_state.chat_history[-MEMORY_CONFIG.get('keep_last', 6):]
+                        memory_header += ("Contexte de la conversation (résumé): " if lang=='fr' else "Conversation context (summary): ") + st.session_state.memory_summary + "\n"
+                    tail = st.session_state.get('chat_history', [])[-MEMORY_CONFIG.get('keep_last',6):]
                     if tail:
                         memory_header += ("Derniers échanges:\n" if lang=='fr' else "Recent turns:\n") + "\n".join(tail) + "\n"
-
-                    # Light language mirroring hint (prefix instruction)
-                    def _detect_lang(txt: str) -> str:
-                        fr_hits = sum(1 for w in [" le ", " la ", " les ", " des ", " de ", " et ", " phase ", " combien ", " projet "] if w in (" " + txt.lower() + " "))
-                        en_hits = sum(1 for w in [" the ", " and ", " phase ", " how many ", " project "] if w in (" " + txt.lower() + " "))
-                        return "fr" if fr_hits >= en_hits else "en"
-
-                    if st.session_state.get('mirror_lang', True):
-                        _lang = _detect_lang(user_question)
-                        if _lang == "en":
-                            memory_header = "Please answer in English.\n" + memory_header
-                        else:
-                            memory_header = "Réponds en français.\n" + memory_header
-
-                    # Confidence/"no-answer" behavior
-                    if GUARDRAIL_CONFIG.get("enable_confidence_gate", True):
-                        min_docs = GUARDRAIL_CONFIG.get("min_docs", 2)
-                        min_score = GUARDRAIL_CONFIG.get("min_evidence_score", 0.35)
-                        if len(reranked_docs) < min_docs or evidence_score < min_score:
-                            # Provide helpful fallback with top snippets
+                    if GUARDRAIL_CONFIG.get('enable_confidence_gate', True):
+                        if len(reranked_docs) < GUARDRAIL_CONFIG.get('min_docs',2) or evidence_score < GUARDRAIL_CONFIG.get('min_evidence_score',0.35):
                             preview = []
                             for d in reranked_docs[:3]:
-                                m = getattr(d, 'metadata', {}) or {}
-                                src = m.get('source', 'doc')
-                                page = m.get('page', '?')
-                                snippet = d.page_content.strip().replace("\n", " ")[:280]
-                                preview.append(f"- {src} p.{page}: {snippet}...")
-                            msg = "Je ne trouve pas de réponse sûre dans les documents fournis. Voici les passages les plus proches:\n" + "\n".join(preview)
+                                md = getattr(d,'metadata',{}) or {}
+                                snippet = d.page_content.strip().replace('\n',' ')[:280]
+                                preview.append(f"- {md.get('source','doc')} p.{md.get('page','?')}: {snippet}...")
+                            msg = localize("Je ne trouve pas de réponse sûre dans les documents fournis. Voici les passages les plus proches:", "I can't find a confident answer in the provided documents. Closest snippets:", lang) + "\n" + "\n".join(preview)
                             response = {"answer": msg, "source_documents": reranked_docs[:3]}
                         else:
-                            response = st.session_state.conversation.invoke({
-                                'question': memory_header + user_question,
-                                'chat_history': formatted_history
-                            })
+                            # If no specialized classification fired, build a generic analytic prompt prefix
+                            base_q = memory_header + user_question
+                            response = st.session_state.conversation.invoke({'question': base_q, 'chat_history': formatted_history})
                     else:
-                        response = st.session_state.conversation.invoke({
-                            'question': memory_header + user_question,
-                            'chat_history': formatted_history
-                        })
-                
-                # Validate response completeness (this will catch missing Phase 00)
-                is_complete, warning_msg = validate_response_completeness(response['answer'], user_question)
-                
-                # Display warning if response seems incomplete
-                if not is_complete:
-                    st.warning(f"⚠️ {warning_msg}")
-                    
-                    # Try to get more context and regenerate with specific emphasis on Phase 00
-                    with st.spinner("🔄 Searching for ALL phases including Phase 00..."):
-                        # Enhanced search specifically for Phase 00
-                        phase_00_query = f"{enhanced_question} phase00 phase 00 étude chiffrage study estimation"
-                        extended_docs = retriever.get_relevant_documents(phase_00_query)
-                        extended_context = create_enhanced_context(extended_docs, user_question)
-                        
-                        # Regenerate with explicit Phase 00 instruction
-                        enhanced_response = st.session_state.conversation.invoke({
-                            'question': f"IMPORTANT: Liste TOUTES les phases y compris la Phase 00 (Étude et chiffrage). Question: {user_question}",
-                            'chat_history': formatted_history
-                        })
-                        
-                        response = enhanced_response
-                
-                # Reset retriever parameters to normal
-                if is_phase_counting and hasattr(retriever, 'search_kwargs'):
-                    retriever.search_kwargs["k"] = RETRIEVAL_CONFIG["initial_k"]
-                    retriever.search_kwargs["fetch_k"] = RETRIEVAL_CONFIG["fetch_k"]
-                
-                # Update memory and chat history
-                update_memory(user_question, response['answer'])
-                
-                # Show source documents for transparency
-                if 'source_documents' in response and response['source_documents']:
+                        response = st.session_state.conversation.invoke({'question': memory_header + user_question, 'chat_history': formatted_history})
+
+                    # Generic fallback injection when model returns empty / extremely short answer
+                    if (not response or not response.get('answer','').strip()) and reranked_docs:
+                        filler = []
+                        for d in reranked_docs[:3]:
+                            md = getattr(d,'metadata',{}) or {}
+                            filler.append(f"[source: {md.get('source','doc')} p.{md.get('page','?')}] {d.page_content.strip()[:180]}...")
+                        generic_msg = localize(
+                            "Aucune réponse directe trouvée. Informations pertinentes extraites:",
+                            "No direct answer found. Relevant extracted information:",
+                            lang
+                        ) + "\n" + "\n".join(filler)
+                        response = {"answer": generic_msg, "source_documents": reranked_docs[:3]}
+
+                # Completeness validation (phases)
+                complete, warn_msg = validate_response_completeness(response['answer'], user_question)
+                if not complete:
+                    st.warning(f"⚠️ {warn_msg}")
+                if qclass.is_phase_count and hasattr(retriever,'search_kwargs'):
+                    retriever.search_kwargs['k'] = RETRIEVAL_CONFIG['initial_k']
+                    retriever.search_kwargs['fetch_k'] = RETRIEVAL_CONFIG['fetch_k']
+                # Post-processing pipeline for final answer text (if present)
+                if response and isinstance(response, dict):
+                    ans = response.get('answer', '')
+                    ans = normalize_answer(ans)
+                    ans = ensure_minimum_citations(ans, response.get('source_documents', []))
+                    if UI_CONFIG.get('highlight_citations'):
+                        ans = wrap_citations(ans)
+                    response['answer'] = ans
+                update_memory(user_question, response.get('answer',''))
+                if response.get('source_documents'):
                     with st.expander("📚 Sources utilisées"):
-                        for i, doc in enumerate(response['source_documents'][:3]):
-                            meta = doc.metadata if hasattr(doc, 'metadata') else {}
-                            src = meta.get('source', 'unknown')
-                            page = meta.get('page', '?')
-                            st.text(f"Source {i+1} — {src} (page {page}):\n{doc.page_content[:400]}...")
-                            
+                        for i,doc in enumerate(response['source_documents'][:3]):
+                            md = getattr(doc,'metadata',{}) or {}
+                            st.text(f"Source {i+1} — {md.get('source','?')} (page {md.get('page','?')}):\n{doc.page_content[:400]}...")
+                # Rationale expander when structured data used
+                if any([getattr(qclass,'is_risks',False), getattr(qclass,'is_kpis',False), qclass.is_phase_count]):
+                    kg = st.session_state.get('knowledge_graph') or {}
+                    with st.expander(localize("🔍 Détails structurés","🔍 Structured details", lang)):
+                        if getattr(qclass,'is_risks',False) and kg.get('risks'):
+                            st.write(f"{len(kg['risks'])} risks parsed.")
+                        if getattr(qclass,'is_kpis',False) and kg.get('kpis'):
+                            st.write(f"{len(kg['kpis'])} KPIs parsed.")
+                        if qclass.is_phase_count and kg.get('phases'):
+                            st.write(f"Phases detected: {', '.join(str(p) for p in sorted(kg['phases'].keys()))}")
+                # Record metrics snapshot after an answered turn
+                record_metrics_snapshot()
+                return
     except Exception as e:
-        st.error(f"❌ Error: {str(e)}")
+        # High-level failure path with graceful degradation
+        if _handle_possible_ollama_error(e, st.session_state.get('doc_language', 'en')):
+            return
+        st.error(localize("Erreur interne lors du traitement de la question.", "Internal error while processing the question.", st.session_state.get('doc_language', 'en')))
+        # Fallback attempt
+        try:
+            st.info("🔄 Trying alternative approach...")
+            if hasattr(st.session_state, 'conversation') and st.session_state.conversation:
+                simple_response = st.session_state.conversation.invoke({
+                    'question': user_question,
+                    'chat_history': []
+                })
+                # Only append if successful
+                try:
+                    update_memory(user_question, simple_response.get('answer', ''))
+                except Exception:
+                    pass
+            else:
+                fallback_msg = localize(
+                    "Je suis désolé, mais je n'ai pas encore de documents à analyser. Veuillez d'abord uploader et traiter vos documents PDF.",
+                    "Sorry, I don't have any processed documents yet. Please upload and process PDFs first.",
+                    st.session_state.get('doc_language', 'en')
+                )
+                try:
+                    update_memory(user_question, fallback_msg)
+                except Exception:
+                    pass
+        except Exception as e2:
+            if _handle_possible_ollama_error(e2, st.session_state.get('doc_language', 'en')):
+                return
+            st.error(localize("Erreur pendant le traitement.", "Error during processing.", st.session_state.get('doc_language', 'en')))
         # Try fallback approach
         try:
             st.info("🔄 Trying alternative approach...")
@@ -1002,8 +1058,10 @@ def handle_user_input(user_question):
                 fallback_msg = "Je suis désolé, mais je n'ai pas encore de documents à analyser. Veuillez d'abord uploader et traiter vos documents PDF."
                 update_memory(user_question, fallback_msg)
             
-        except Exception as e2:
-            st.error(f"❌ Fallback also failed: {str(e2)}")
+        except Exception as e:
+            if _handle_possible_ollama_error(e, st.session_state.get('doc_language', 'en')):
+                return
+            st.error(localize("Erreur interne lors du traitement de la question.", "Internal error while processing the question.", st.session_state.get('doc_language', 'en')))
 
 def main():
     load_dotenv()
@@ -1103,6 +1161,18 @@ def main():
                                 st.session_state.subject_index = build_subject_index(text_chunks, st.session_state.get('pdf_meta', {}))
                             except Exception:
                                 st.session_state.subject_index = {}
+                            # Build knowledge graph
+                            try:
+                                st.session_state.knowledge_graph = build_knowledge_graph(text_chunks)
+                            except Exception:
+                                st.session_state.knowledge_graph = {}
+                            # Document statistics
+                            chunk_lengths = [len(c.page_content) for c in text_chunks]
+                            st.session_state.doc_stats = {
+                                'pdf_count': len(pdf_docs),
+                                'chunk_count': len(text_chunks),
+                                'avg_chunk_chars': int(sum(chunk_lengths)/max(1,len(chunk_lengths)))
+                            }
                             vectorstore = get_vectorstore(text_chunks)
                             if not vectorstore:
                                 st.error("Processing failed")
@@ -1125,7 +1195,9 @@ def main():
                             else:
                                 st.error("Setup failed")
                     except Exception as e:
-                        st.error(f"Error: {str(e)[:50]}...")
+                        if not _handle_possible_ollama_error(e, st.session_state.get('doc_language', 'en')):
+                            st.error(localize("Erreur pendant le traitement.", "Error during processing.", st.session_state.get('doc_language', 'en')))
+        # Metrics panel removed for simplified UI
         
     # Show status (outside sidebar)
     if st.session_state.conversation:

@@ -251,9 +251,13 @@ def extract_subject_from_docs(retrieved_docs):
     """
     subject_patterns = [
         r"\bobjet\b[:\-]?\s*(.+)",
+        r"\bsujet\b[:\-]?\s*(.+)",
+        r"\bth[eè]me\b[:\-]?\s*(.+)",
         r"\bsubject\b[:\-]?\s*(.+)",
         r"\bpurpose\b[:\-]?\s*(.+)",
         r"\bscope\b[:\-]?\s*(.+)",
+        r"\btopic\b[:\-]?\s*(.+)",
+        r"\bintitul[ée]\b[:\-]?\s*(.+)",
         r"^\s*[A-Z][A-Z \-/]{8,}$"  # ALL CAPS title line
     ]
     for doc in retrieved_docs[:6]:  # favor early, most relevant docs

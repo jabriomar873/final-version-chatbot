@@ -1,21 +1,23 @@
-# �️ CAVEO Chatbot – Local PDF Intelligence
+# 🧠 CAVEO Chatbot – Local PDF Intelligence
 
-CAVEO Chatbot lets you load multiple PDF documents (text or scanned) and interrogate them using a single local LLM (fixed: `llama3.1:8b-instruct-q4_K_M`).
-It combines hybrid retrieval (FastEmbed + BM25 + optional re‑ranking) with deterministic phase/subject extraction and a clean minimalist dark UI.
+CAVEO Chatbot lets you load multiple PDF documents (text or scanned) and interrogate them using a single local LLM (locked: `llama3.1:8b-instruct-q4_K_M`).
+It combines hybrid retrieval (FastEmbed + BM25 + optional neural re‑ranking) with deterministic phase / subject / actor extraction, caching, guardrails, and a minimalist dark UI.
 
-Everything runs **100% locally**: no external API calls, no data leaves your machine.
+Everything runs **100% locally** – no external API calls; documents, embeddings, and answers stay on your machine.
 
 ## ✨ Core Features
 
-- **Multi‑PDF ingestion** – drag & browse multiple files, processes text & scanned pages (OCR fallback)  
-- **Hybrid retrieval** – Dense FastEmbed (ONNX, CPU) + BM25 + optional neural reranker + citation building  
+- **Multi‑PDF ingestion** – drag & browse multiple files; handles text & scanned pages (OCR fallback)  
+- **Hybrid retrieval** – FastEmbed dense vectors + BM25 fusion + optional neural re‑rank + citation context  
+- **Embedding cache** – Deterministic content hashing → skip recomputation on re‑processing same docs  
 - **Deterministic extractors** – Subjects, phases (00..), actors, critical context mapping  
-- **Memory + summarization** – Lightweight conversation memory with auto summarizer (local)  
-- **Confidence guardrails** – Falls back with evidence snippets if answer confidence is low  
-- **Language mirroring** – Answers in French or English based on question (can be toggled in code)  
+- **Conversation memory + summarization** – Rolling summary + on‑demand structured document summary  
+- **Confidence guardrails** – Low‑evidence fallback with top snippets instead of hallucination  
+- **Language enforcement** – Answers in dominant document language (with question language fallback)  
 - **Watermark branding** – Subtle centered translucent “CAVEO” background  
-- **Minimal dark UI** – Only three controls in sidebar: Reset · Browse · Process  
-- **Fully offline** – No torch GPU requirement; CPU friendly  
+- **Minimal dark UI** – Only three controls: Reset · Browse · Process  
+- **Metrics instrumentation** – Tracks embedding build time + retrieval & rerank latency (UI panel WIP)  
+- **Fully offline** – No external APIs; CPU friendly (TF‑IDF fallback if embeddings unavailable)  
 
 ## 🚀 Quick Start
 
@@ -78,7 +80,7 @@ The application will open in your default web browser at `http://localhost:8501`
 
 1. **Browse** – Select one or more PDF files (scanned or text).  
 2. **Process** – Builds embeddings, hybrid index, subject & phase maps.  
-3. **Chat** – Ask domain or structural questions (e.g., “How many phases?”, “List actors”, “Subject of all documents”).  
+3. **Chat** – Ask domain or structural questions (e.g., “How many phases?”, “List actors”, “Subject of all documents”) or just freeform explore.  
 4. **Reset** – Clears memory + indexes (safe to re‑process new sets).  
 
 ## 🏗️ Architecture
@@ -97,15 +99,16 @@ User Query -> Intent detection -> (Enhanced query) -> Hybrid Retrieval -> Guardr
 
 ```
 CAVEO-chat-main/
-├── app.py                # Main application
-├── config.py             # Retrieval, model, guardrail configs
-├── enhanced_retrieval.py # Query enhancement, rerank, context builders
-├── intent_detection.py   # Intent classification + simple responses
-├── htmlTemplates.py      # Chat UI + watermark + custom CSS
-├── requirements.txt      # Dependencies
-├── start_app.bat         # (Optional) Windows launcher (light theme flag removed in code)
+├── app.py                # Main application (retrieval pipeline + UI + memory)
+├── config.py             # All configuration dictionaries (retrieval, LLM, guardrails, caching, metrics)
+├── enhanced_retrieval.py # Query enhancement, rerank, context builders, structured extractors
+├── intent_detection.py   # Intent classification + localized small‑talk responses
+├── cache_utils.py        # Embedding/document cache helpers (hashing + serialize vectors)
+├── htmlTemplates.py      # Chat UI templates, watermark, CSS (incl. citation highlight class)
+├── requirements.txt      # Dependencies (core + optional)
+├── start_app.bat         # Windows launcher convenience script
 ├── .streamlit/config.toml# Dark theme enforcement
-└── scripts/              # Utility scripts
+└── scripts/              # Utility scripts / future evaluation tooling
 ```
 
 ## 🔧 Configuration
@@ -169,6 +172,7 @@ Set in code to suppress noisy logs / speed up imports (torch profiling off, warn
 - pypdf, PyMuPDF (fallback OCR image generation), pytesseract, Pillow
 
 ### Utilities
+Optional (planned / experimental): `qdrant-client`, `tqdm`, `diskcache`
 - python-dotenv, numpy, pydantic
 
 ## 📋 System Requirements
@@ -204,5 +208,22 @@ If you encounter any issues:
 This project is open source. Please check the license file for details.
 
 ---
+
+## 🗺️ Roadmap (Short‑Term)
+
+- [ ] Sidebar metrics panel (embed build, retrieval, rerank timing)
+- [ ] Inline citation highlighting logic (function wrapping answer segments)
+- [ ] Evaluation script (`scripts/eval_sample.py`) for batch Q&A scoring
+- [ ] Download/export chat with source citations (Markdown)
+- [ ] Confidence badge + answer provenance block
+
+## ✅ Completed Highlights
+- Hybrid retrieval + rerank
+- Deterministic phase / subject / actor extraction
+- Embedding cache (content hash)
+- Language enforcement (document dominant)
+- Summarization path (explicit “summarize” intent)
+- Guardrail fallback with evidence snippets
+- Watermark + minimalist dark UI
 
 **Made with ❤️ by/for CAVEO – secure, local document intelligence.**
