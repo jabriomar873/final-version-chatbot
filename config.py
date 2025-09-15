@@ -178,7 +178,9 @@ VALIDATION_CONFIG = {
         "numbered_lists": 5,
         "structure_indicators": 3,
         "completeness_bonus": 15
-    }
+    },
+    # UI: show or hide phase completeness warning banner
+    "show_completeness_warning": False
 }
 
 # Prompt Templates

@@ -43,7 +43,7 @@ from enhanced_retrieval import (
 from config import (
     RETRIEVAL_CONFIG, TEXT_CONFIG, TFIDF_CONFIG, FASTEMBED_CONFIG, RERANK_CONFIG,
     LLM_CONFIG, PROMPT_TEMPLATES, MEMORY_CONFIG, GUARDRAIL_CONFIG, PERSISTENCE_CONFIG,
-    CACHING_CONFIG, METRICS_CONFIG, UI_CONFIG
+    CACHING_CONFIG, METRICS_CONFIG, UI_CONFIG, VALIDATION_CONFIG
 )
 from cache_utils import cache_key, load_cache, save_cache
 from intent_detection import detect_intent, generate_greeting_response, generate_simple_chat_response, should_use_enhanced_retrieval
@@ -70,7 +70,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # ---------------------------------------------------------------------------
 # Application constants / default model
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "llama3.1:8b-instruct-q4_K_M"  # Force use of this model as per user request
+DEFAULT_MODEL = "llama3.1:8b-instruct-q4_K_M"  # Initial fallback model
 
 # ---------------------------------------------------------------------------
 # Lightweight language detection (English vs French) without external deps
@@ -577,6 +577,14 @@ def check_ollama_installation():
     except:
         return False
 
+def ensure_model_available(model_name: str) -> bool:
+    """Ensure a specific model is available locally; show guidance if missing."""
+    models = get_available_ollama_models()
+    if model_name not in models:
+        st.warning(f"Model '{model_name}' not found locally. Pull it in a terminal: ollama pull {model_name}")
+        return False
+    return True
+
 # ---------------- Friendly Ollama error handling (memory, etc.) ----------------
 def _is_model_memory_error(msg: str) -> bool:
     if not msg:
@@ -992,7 +1000,7 @@ def handle_user_input(user_question):
 
                 # Completeness validation (phases)
                 complete, warn_msg = validate_response_completeness(response['answer'], user_question)
-                if not complete:
+                if not complete and VALIDATION_CONFIG.get('show_completeness_warning', True):
                     st.warning(f"⚠️ {warn_msg}")
                 if qclass.is_phase_count and hasattr(retriever,'search_kwargs'):
                     retriever.search_kwargs['k'] = RETRIEVAL_CONFIG['initial_k']
@@ -1121,13 +1129,20 @@ def main():
             st.rerun()
         st.stop()
 
-    # Helper to test if required model is present
-    def _ensure_default_model():
-        models = get_available_ollama_models()
-        if DEFAULT_MODEL not in models:
-            st.warning(f"Required model '{DEFAULT_MODEL}' not found. Pull it in a terminal: ollama pull {DEFAULT_MODEL}")
-            return False
-        return True
+    # Initialize selected model state (prefer first installed preferred model)
+    if 'selected_model' not in st.session_state:
+        installed = get_available_ollama_models()
+        preferred = LLM_CONFIG.get('preferred_models', [])
+        chosen = None
+        for m in preferred:
+            if m in installed:
+                chosen = m; break
+        if not chosen:
+            chosen = installed[0] if installed else DEFAULT_MODEL
+        st.session_state.selected_model = chosen
+
+    # Model selection UI (sidebar will be built later; we cache list early for speed)
+    installed_models = get_available_ollama_models()
     
     # Handle user input (after form submission)
     if 'user_question' not in locals():
@@ -1139,8 +1154,36 @@ def main():
         else:
             st.warning("Please process documents first.")
     
-    # **SIMPLE SIDEBAR FOR DOCUMENTS**
+    # **SIDEBAR: Model selection + Documents**
     with st.sidebar:
+        # Model selection section
+        st.header("Model")
+        preferred = LLM_CONFIG.get('preferred_models', [])
+        ordered = [m for m in preferred if m in installed_models]
+        # Append any other installed models not already listed
+        for m in installed_models:
+            if m not in ordered:
+                ordered.append(m)
+        if ordered:
+            try:
+                current_idx = ordered.index(st.session_state.get('selected_model', ordered[0]))
+            except ValueError:
+                current_idx = 0
+            new_model = st.selectbox("LLM Model", ordered, index=current_idx, help="Select which local Ollama model to use for answering.")
+            if new_model != st.session_state.get('selected_model'):
+                st.session_state.selected_model = new_model
+            apply_disabled = not st.session_state.get('retriever') or not ensure_model_available(st.session_state.selected_model)
+            if st.button("Apply Model", use_container_width=True, disabled=apply_disabled):
+                if ensure_model_available(st.session_state.selected_model) and st.session_state.get('retriever'):
+                    chain = get_conversation_chain(st.session_state.retriever, st.session_state.selected_model)
+                    if chain:
+                        st.session_state.conversation = chain
+                        st.session_state.model_info = {'model': st.session_state.selected_model}
+                        st.success("Model applied.")
+        else:
+            st.warning("No local models detected. Use 'ollama pull <model>' in a terminal.")
+
+        st.markdown("---")
         st.header("Documents")
         # Uniform width buttons: Reset, Browse, Process
         if st.button("Reset", use_container_width=True):
@@ -1158,8 +1201,8 @@ def main():
             label_visibility="collapsed"
         )
 
-        if st.button("Process", use_container_width=True, disabled=not _ensure_default_model()):
-            if not _ensure_default_model():
+        if st.button("Process", use_container_width=True, disabled=not ensure_model_available(st.session_state.selected_model)):
+            if not ensure_model_available(st.session_state.selected_model):
                 st.stop()
             if not pdf_docs:
                 st.warning("Select PDFs first")
@@ -1193,13 +1236,14 @@ def main():
                                 st.error("Processing failed")
                                 return
                             retriever = build_hybrid_retriever(vectorstore, text_chunks)
-                            if not _ensure_default_model():
+                            if not ensure_model_available(st.session_state.selected_model):
                                 return
-                            conversation_chain = get_conversation_chain(retriever, DEFAULT_MODEL)
+                            # Build conversation chain with currently selected model
+                            conversation_chain = get_conversation_chain(retriever, st.session_state.selected_model)
                             if conversation_chain:
                                 st.session_state.conversation = conversation_chain
                                 st.session_state.retriever = retriever
-                                st.session_state.model_info = {'model': DEFAULT_MODEL}
+                                st.session_state.model_info = {'model': st.session_state.selected_model}
                                 st.session_state.phase_cache = None
                                 try:
                                     if PERSISTENCE_CONFIG.get("persist_faiss"):
@@ -1216,7 +1260,8 @@ def main():
         
     # Show status (outside sidebar)
     if st.session_state.conversation:
-        st.caption(f"Model: {DEFAULT_MODEL}")
+        current_model = st.session_state.get('model_info', {}).get('model', st.session_state.get('selected_model', DEFAULT_MODEL))
+        st.caption(f"Model: {current_model}")
     
     # **CHAT AREA - MAIN CONTENT**
     st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
